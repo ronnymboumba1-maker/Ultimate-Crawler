@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-JATHNIEL-WEB-CRAWLER-PRO v4.0
-Crawler web professionnel avec détection et extraction de bases de données exposées
+JATHNIEL-WEB-CRAWLER-PRO v5.0
+Crawler web pro + Forced Browsing + Extraction DB + Port Scan
++ Subdomain Enum + Wayback + Rich TUI
 
-Pour Ubuntu/WSL - Usage éducatif et tests de sécurité autorisés uniquement
-(cadre CTF, labo personnel, DVWA, WebGoat, etc.)
-
-NOUVEAUTÉS v4.0 :
-[OK] Détection de bases de données exposées (SQLite, MySQL, PostgreSQL, MongoDB, Redis)
-[OK] Identification par magic bytes (extension trompeuse gérée)
-[OK] Ouverture automatique des SQLite + dump des tables
-[OK] Parsing des dumps SQL (CREATE TABLE + INSERT)
-[OK] Détection des liens DB dans le HTML
-[OK] Rapport structuré avec tables, colonnes et échantillons
+Usage éducatif / CTF / labo / pentests autorisés uniquement.
 """
 
 import os
@@ -24,1745 +15,778 @@ import json
 import re
 import hashlib
 import threading
-import queue
 import socket
 import urllib3
 import shutil
 import sqlite3
 import gzip
-import bz2
-import lzma
 import zipfile
-import tarfile
 from datetime import datetime
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode
-from typing import Dict, List, Tuple, Optional, Any
+from pathlib import Path
+from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque, defaultdict
-from io import BytesIO
+from typing import Dict, List, Optional, Any
 
 import requests
 from bs4 import BeautifulSoup
-import mimetypes
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.prompt import Prompt, Confirm
+from rich.live import Live
+from rich.layout import Layout
+from rich.text import Text
+from rich import box
 
-# Désactiver les avertissements SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+console = Console()
+
+# ==================== FORCED BROWSING WORDLIST (180+) ====================
+
+FORCED_PATHS = [
+    # Config / env
+    "/.env", "/.env.local", "/.env.production", "/.env.backup", "/.env.old",
+    "/config.php", "/configuration.php", "/config.inc.php", "/settings.php",
+    "/wp-config.php", "/wp-config.php.bak", "/config.yml", "/config.yaml",
+    "/application.yml", "/application.properties", "/web.config", "/app.config",
+    "/database.yml", "/db.php", "/db.ini", "/php.ini", "/.htaccess", "/.htpasswd",
+    # Git / VCS
+    "/.git/HEAD", "/.git/config", "/.git/index", "/.gitignore", "/.svn/entries",
+    "/.hg/hgrc", "/.DS_Store", "/Thumbs.db",
+    # Backups
+    "/backup.zip", "/backup.tar.gz", "/backup.sql", "/db.sql", "/dump.sql",
+    "/database.sql", "/backup/", "/backups/", "/old/", "/temp/", "/tmp/",
+    "/www.zip", "/site.zip", "/html.zip", "/public.zip", "/src.zip",
+    # Databases
+    "/database.db", "/data.db", "/app.db", "/users.db", "/test.db",
+    "/database.sqlite", "/data.sqlite", "/app.sqlite", "/database.sqlite3",
+    "/dump.rdb", "/redis.rdb", "/mongodb.archive", "/pg_dump.sql",
+    # Admin
+    "/admin/", "/administrator/", "/admin.php", "/login.php", "/signin.php",
+    "/panel/", "/dashboard/", "/cpanel/", "/webmail/", "/phpmyadmin/",
+    "/adminer.php", "/adminer/", "/manager/", "/console/", "/backend/",
+    # API
+    "/api/", "/api/v1/", "/api/v2/", "/graphql", "/swagger/", "/swagger-ui/",
+    "/api-docs/", "/openapi.json", "/swagger.json", "/v1/", "/v2/",
+    # Logs / debug
+    "/logs/", "/log/", "/debug/", "/error.log", "/access.log", "/app.log",
+    "/laravel.log", "/storage/logs/", "/var/log/",
+    # Docker / CI
+    "/Dockerfile", "/docker-compose.yml", "/.dockerenv", "/Makefile",
+    "/.travis.yml", "/.gitlab-ci.yml", "/Jenkinsfile", "/Vagrantfile",
+    # Dependencies
+    "/composer.json", "/composer.lock", "/package.json", "/package-lock.json",
+    "/yarn.lock", "/requirements.txt", "/Pipfile", "/Gemfile", "/pom.xml",
+    # Discovery
+    "/robots.txt", "/sitemap.xml", "/crossdomain.xml", "/security.txt",
+    "/humans.txt", "/.well-known/security.txt", "/clientaccesspolicy.xml",
+    # Common sensitive
+    "/server-status", "/server-info", "/phpinfo.php", "/info.php", "/test.php",
+    "/shell.php", "/cmd.php", "/eval.php", "/upload.php", "/filemanager/",
+    "/elfinder/", "/ckeditor/", "/tinymce/",
+    # More backups / old
+    "/index.php.bak", "/index.html.bak", "/config.bak", "/.bak", "/.old",
+    "/.save", "/.swp", "/~", "/archive/", "/archives/", "/export/",
+    "/data/", "/db/", "/sql/", "/dumps/", "/mysql/", "/sqlite/",
+    # Auth keys
+    "/id_rsa", "/id_rsa.pub", "/id_dsa", "/.ssh/id_rsa", "/.ssh/authorized_keys",
+    "/authorized_keys", "/known_hosts",
+    # CMS specific
+    "/wp-admin/", "/wp-login.php", "/wp-content/debug.log", "/xmlrpc.php",
+    "/user/login", "/user/register", "/admin/login", "/administrator/index.php",
+]
+
+DB_PORTS = {
+    3306: "MySQL/MariaDB",
+    5432: "PostgreSQL",
+    27017: "MongoDB",
+    6379: "Redis",
+    9200: "Elasticsearch",
+    9300: "Elasticsearch (transport)",
+    11211: "Memcached",
+    1433: "MSSQL",
+    1521: "Oracle",
+}
+
+SUBDOMAIN_WORDLIST = [
+    "www", "mail", "ftp", "localhost", "webmail", "smtp", "pop", "ns1", "webdisk",
+    "ns2", "cpanel", "whm", "autodiscover", "autoconfig", "m", "imap", "test",
+    "ns", "blog", "pop3", "dev", "www2", "admin", "forum", "news", "vpn",
+    "ns3", "mail2", "new", "mysql", "old", "lists", "support", "mobile", "mx",
+    "static", "docs", "beta", "shop", "sql", "secure", "demo", "cp", "calendar",
+    "wiki", "web", "media", "email", "images", "img", "www1", "intranet",
+    "portal", "video", "sip", "dns2", "api", "cdn", "stats", "dns1", "ns4",
+    "www3", "dns", "search", "staging", "server", "mx1", "chat", "wap", "my",
+    "svn", "mail1", "sites", "proxy", "ads", "online", "remote", "mx2", "ftp2",
+    "api2", "git", "gitlab", "jenkins", "ci", "monitor", "status", "db", "db1",
+]
 
 
-class JATHNIELCrawlerPro:
-    """Crawler web professionnel avec extraction de bases de données exposées."""
-    
+class CrawlerPro:
     def __init__(self):
-        # Configuration
         self.config = {
-            'max_depth': 3,
-            'max_pages': 500,
-            'max_files': 100,
-            'threads': 10,
-            'timeout': 30,
-            'delay': 0.5,
-            'user_agent': 'JATHNIEL-Crawler-Pro/4.0 (Educational; CTF/Lab)',
-            'output_dir': './crawled_sites',
-            'download_sensitive': True,
-            'download_assets': True,
-            'respect_robots': True,
-            'javascript': False,
-            'follow_redirects': True,
-            'verify_ssl': False,
-            'analyze_db': True,       # Analyse auto des DB trouvées
-            'auto_extract_zip': True, # Extraction auto des archives
+            "max_depth": 3,
+            "max_pages": 400,
+            "threads": 12,
+            "timeout": 12,
+            "delay": 0.3,
+            "user_agent": "JATHNIEL-Crawler-Pro/5.0 (CTF/Lab)",
+            "output_dir": "./crawled_sites",
+            "verify_ssl": False,
+            "forced_browsing": True,
+            "port_scan": True,
+            "subdomain_enum": True,
+            "wayback": True,
+            "analyze_db": True,
         }
-        
-        # État
         self.target_url = ""
         self.target_domain = ""
-        self.visited_urls = set()
-        self.visited_files = set()
+        self.base_scheme = "https"
+        self.visited = set()
         self.queue = deque()
-        self.results = {
-            'pages': [],
-            'assets': [],
-            'sensitive_files': [],
-            'databases': [],       # Nouveau : bases trouvées
-            'db_contents': {},     # Nouveau : contenu des DB
-            'forms': [],
-            'links': [],
-            'emails': [],
-            'technologies': [],
-            'admin_pages': [],
-            'comments': [],
-            'vulnerabilities': [],
-            'statistics': {
-                'total_pages': 0,
-                'total_assets': 0,
-                'total_sensitive': 0,
-                'total_databases': 0,
-                'total_size': 0,
-                'start_time': None,
-                'end_time': None,
-                'duration': 0
-            }
-        }
-        
         self.lock = threading.Lock()
-        self.scanning = False
-        self.pause = False
-        
-        # ==================== LISTES SENSIBLES ====================
-        
-        # Extensions sensibles
-        self.sensitive_extensions = [
-            # Configuration
-            '.env', '.env.local', '.env.prod', '.env.backup',
-            '.ini', '.conf', '.config', '.cfg',
-            '.yml', '.yaml', '.xml', '.json', '.toml',
-            # Base de données
-            '.sql', '.db', '.sqlite', '.sqlite3', '.db3', '.s3db',
-            '.dump', '.bson', '.rdb', '.pgdump', '.archive',
-            # Archives
-            '.zip', '.rar', '.7z', '.tar', '.gz', '.tgz', '.bz2', '.xz',
-            # Auth / certificats
-            '.pem', '.crt', '.cer', '.key', '.p12', '.pfx', '.ppk',
-            # Logs
-            '.log',
-            # Binaires suspects
-            '.bin', '.dat', '.raw', '.img', '.iso',
-        ]
-        
-        # Noms de fichiers sensibles
-        self.sensitive_filenames = [
-            # Config
-            'wp-config.php', 'config.php', 'configuration.php',
-            'settings.py', 'settings.json', 'appsettings.json',
-            'web.config', 'app.config', 'database.yml', 'db.php',
-            'config.inc.php', 'php.ini', 'nginx.conf', 'httpd.conf',
-            # Discovery
-            'robots.txt', 'sitemap.xml', 'crossdomain.xml',
-            'humans.txt', 'security.txt', 'clientaccesspolicy.xml',
-            # Auth / clés
-            'passwd', 'shadow', 'sudoers',
-            'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
-            'authorized_keys', 'known_hosts',
-            '.bash_history', '.bashrc', '.profile', '.gitconfig',
-            '.gitignore', '.DS_Store', 'Thumbs.db', '.htaccess', '.htpasswd',
-            # Dépendances
-            'composer.json', 'composer.lock', 'package.json',
-            'package-lock.json', 'yarn.lock', 'requirements.txt',
-            'Gemfile', 'Gemfile.lock', 'pom.xml', 'build.gradle',
-            # Docker / CI
-            'Dockerfile', 'docker-compose.yml', 'Makefile', 'Vagrantfile',
-            '.travis.yml', '.gitlab-ci.yml', 'Jenkinsfile',
-            # Docs
-            'README.md', 'README.txt', 'INSTALL', 'CHANGELOG.md',
-            'LICENSE', 'COPYING',
-        ]
-        
-        # Noms spécifiques aux bases de données
-        self.database_filenames = [
-            'database.db', 'data.db', 'app.db', 'main.db', 'site.db',
-            'users.db', 'test.db', 'prod.db', 'dev.db',
-            'database.sqlite', 'data.sqlite', 'app.sqlite',
-            'database.sqlite3', 'data.sqlite3', 'app.sqlite3',
-            'dump.sql', 'database.sql', 'backup.sql', 'db.sql',
-            'mysql.sql', 'data.sql', 'dump.sqlite',
-            'pg_dump.sql', 'postgres.sql', 'database.pgdump',
-            'dump.rdb', 'redis.rdb', 'mongodb.archive',
-        ]
-        
-        # Dossiers sensibles
-        self.sensitive_directories = [
-            '/admin/', '/administrator/', '/backup/', '/backups/',
-            '/private/', '/secret/', '/config/', '/configs/',
-            '/db/', '/database/', '/sql/', '/dumps/', '/dump/',
-            '/.git/', '/.svn/', '/.hg/', '/.env/',
-            '/logs/', '/log/', '/tmp/', '/temp/',
-            '/api/', '/v1/', '/v2/', '/graphql',
-            '/swagger/', '/api-docs/', '/phpmyadmin/',
-            '/adminer/', '/shell/', '/test/', '/data/',
-            '/export/', '/mysql/', '/sqlite/',
-        ]
-        
-        # Alias de compatibilité
-        self.sensitive_files = self.sensitive_extensions + self.sensitive_filenames
-        
-        # Extensions d'assets
-        self.asset_extensions = [
-            '.css', '.js', '.json', '.xml', '.txt', '.md',
-            '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.webp',
-            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-            '.mp3', '.mp4', '.avi', '.mkv', '.mov', '.wav',
-            '.woff', '.woff2', '.ttf', '.eot', '.otf'
-        ]
-        
-        # Patterns d'admin
-        self.admin_patterns = [
-            'admin', 'administrator', 'login', 'signin', 'panel', 'dashboard',
-            'backoffice', 'backend', 'cpanel', 'webmail', 'manager',
-            'moderator', 'staff', 'sysadmin', 'root', 'control'
-        ]
-        
-        # Patterns de technologies
-        self.tech_patterns = {
-            'WordPress': ['wp-content', 'wp-includes', 'wp-json', 'wp-admin'],
-            'Drupal': ['drupal', 'sites/all', 'drupal.js'],
-            'Joomla': ['joomla', 'com_content', 'modules/mod_'],
-            'Laravel': ['laravel', 'csrf-token', '_token'],
-            'Django': ['django', 'csrfmiddlewaretoken', 'admin/'],
-            'Rails': ['rails', 'authenticity_token', 'application.js'],
-            'Express': ['express', 'x-powered-by: express'],
-            'Flask': ['flask', 'x-powered-by: flask'],
-            'React': ['react', 'react-dom', 'react.min.js'],
-            'Vue': ['vue.js', 'vue.min.js', 'v-bind'],
-            'Angular': ['angular', 'ng-app', 'ng-controller'],
-            'jQuery': ['jquery', 'jquery.min.js', 'jquery-'],
-            'Bootstrap': ['bootstrap', 'navbar', 'bootstrap.min.css'],
-            'FontAwesome': ['font-awesome', 'fa-', 'fa-solid'],
-            'GoogleAnalytics': ['ga.js', 'gtag.js', 'analytics.js'],
-            'Cloudflare': ['cf-ray', '__cfduid', 'cloudflare'],
-            'AmazonAWS': ['aws.amazon', 'x-amz', 'amazonaws']
+        self.results = {
+            "pages": [],
+            "sensitive": [],
+            "databases": [],
+            "db_contents": {},
+            "admin": [],
+            "emails": set(),
+            "forms": [],
+            "techs": set(),
+            "subdomains": [],
+            "open_ports": [],
+            "wayback_urls": [],
+            "forced_hits": [],
+            "stats": {
+                "pages": 0, "sensitive": 0, "databases": 0,
+                "start": None, "end": None, "duration": 0,
+            },
         }
-        
-        # Signatures magic bytes pour identification
-        self.magic_signatures = {
-            b'SQLite format 3\x00': 'sqlite',
-            b'PK\x03\x04': 'zip',
-            b'PK\x05\x06': 'zip_empty',
-            b'\x1f\x8b': 'gzip',
-            b'BZh': 'bzip2',
-            b'\xfd7zXZ\x00': 'xz',
-            b'\x89PNG\r\n\x1a\n': 'png',
-            b'\xff\xd8\xff': 'jpeg',
-            b'GIF87a': 'gif',
-            b'GIF89a': 'gif',
-            b'%PDF-': 'pdf',
-            b'\x7fELF': 'elf',
-            b'MZ': 'exe',
-            b'Rar!\x1a\x07': 'rar',
-            b'7z\xbc\xaf\x27\x1c': '7z',
-            b'REDIS': 'redis_dump',
-            b'BSON': 'bson',
-            b'-- MySQL dump': 'mysql_dump',
-            b'-- PostgreSQL database dump': 'postgres_dump',
-            b'-- SQLite': 'sqlite_dump',
-        }
-        
-        self.clear_screen()
-        self.show_banner()
-    
-    def clear_screen(self):
-        os.system('clear' if os.name == 'posix' else 'cls')
-    
-    def colorize(self, text, color='white', bold=False):
-        colors = {
-            'red': '\033[91m',
-            'green': '\033[92m',
-            'yellow': '\033[93m',
-            'blue': '\033[94m',
-            'magenta': '\033[95m',
-            'cyan': '\033[96m',
-            'white': '\033[97m',
-            'bold': '\033[1m',
-            'end': '\033[0m'
-        }
-        bold_text = colors['bold'] if bold else ''
-        return f"{colors.get(color, '')}{bold_text}{text}{colors['end']}"
-    
-    def show_banner(self):
-        banner = f"""
-{self.colorize('╔══════════════════════════════════════════════════════════════════════════════╗', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('██╗ █████╗ ████████╗██╗  ██╗███╗   ██╗██╗███████╗██╗     ██╗   ██╗', 'red')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('██║██╔══██╗╚══██╔══╝██║  ██║████╗  ██║██║██╔════╝██║     ██║   ██║', 'red')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('██║███████║   ██║   ███████║██╔██╗ ██║██║█████╗  ██║     ██║   ██║', 'red')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('██║██╔══██║   ██║   ██╔══██║██║╚██╗██║██║██╔══╝  ██║     ██║   ██║', 'red')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('██║██║  ██║   ██║   ██║  ██║██║ ╚████║██║███████╗███████╗╚██████╔╝', 'red')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝╚══════╝╚══════╝ ╚═════╝ ', 'red')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('              WEB CRAWLER PRO v4.0 - JATHNIEL EDITION', 'yellow')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('     🕷️  Crawler + Extraction de bases de données exposées  🕷️', 'green')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('           🛡️  CTF / Labo - Usage autorisé uniquement  🛡️', 'magenta')}  {self.colorize('║', 'cyan')}
-{self.colorize('║', 'cyan')}  {self.colorize('                              ★  JATHNIEL  ★                                  ', 'yellow')}  {self.colorize('║', 'cyan')}
-{self.colorize('╚══════════════════════════════════════════════════════════════════════════════╝', 'cyan')}
-        """
-        print(banner)
-    
-    def show_menu(self):
-        """Affiche le menu principal."""
-        status = self.colorize('● EN COURS', 'green') if self.scanning else self.colorize('○ ARRETE', 'red')
-        
-        menu = f"""
-{self.colorize('┌────────────────────────────────────────────────────────────────────────────────────┐', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('MENU PRINCIPAL - WEB CRAWLER PRO v4.0', 'bold')}                                          {self.colorize('│', 'cyan')}
-{self.colorize('├────────────────────────────────────────────────────────────────────────────────────┤', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('1.', 'yellow')}  {self.colorize('Lancer un crawl complet', 'white')}                                                 {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('2.', 'yellow')}  {self.colorize('Crawl + extraction de bases de donnees', 'white')}                              {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('3.', 'yellow')}  {self.colorize('Telecharger un fichier specifique', 'white')}                                       {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('4.', 'yellow')}  {self.colorize('Voir les resultats du crawl', 'white')}                                             {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('5.', 'yellow')}  {self.colorize('Voir les fichiers sensibles trouves', 'white')}                                     {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('6.', 'yellow')}  {self.colorize('Voir les bases de donnees extraites', 'white')}                                   {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('7.', 'yellow')}  {self.colorize('Exporter les resultats (JSON/HTML)', 'white')}                                      {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('8.', 'yellow')}  {self.colorize('Configuration', 'white')}                                                          {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('9.', 'yellow')}  {self.colorize('Statistiques du crawl', 'white')}                                                   {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('10.', 'yellow')} {self.colorize('Aide / Documentation', 'white')}                                                    {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('0.', 'yellow')}  {self.colorize('Quitter', 'white')}                                                               {self.colorize('│', 'cyan')}
-{self.colorize('├────────────────────────────────────────────────────────────────────────────────────┤', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('📌 Cible:', 'bold')} {self.target_url if self.target_url else self.colorize('Aucune', 'red')}  {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('📄 Pages:', 'bold')} {self.results['statistics']['total_pages']}  {self.colorize('📁 Sensibles:', 'bold')} {self.results['statistics']['total_sensitive']}  {self.colorize('🗄️  DB:', 'bold')} {self.results['statistics']['total_databases']}  {self.colorize('│', 'cyan')}
-{self.colorize('│', 'cyan')}  {self.colorize('📊 Statut:', 'bold')} {status}  {self.colorize('│', 'cyan')}
-{self.colorize('└────────────────────────────────────────────────────────────────────────────────────┘', 'cyan')}
-        """
-        print(menu)
-    
-    def get_user_input(self, prompt, default=""):
-        if default:
-            prompt = f"{prompt} [{default}]: "
-        else:
-            prompt = f"{prompt}: "
-        return input(self.colorize(prompt, 'yellow')).strip() or default
-    
-    def get_yes_no(self, prompt):
-        while True:
-            response = input(self.colorize(f"{prompt} (o/n): ", 'yellow')).lower()
-            if response in ['o', 'oui', 'y', 'yes']:
-                return True
-            elif response in ['n', 'non', 'no']:
-                return False
-            else:
-                print(self.colorize("❌ Repondez par 'o' ou 'n'", 'red'))
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": self.config["user_agent"]})
+        self.session.verify = self.config["verify_ssl"]
 
-    # ==================== MOTEUR DE CRAWL ====================
-    
-    def crawl_complete(self, url):
-        """Crawl complet avec extraction de fichiers et bases."""
-        self.target_url = url
-        self.target_domain = urlparse(url).netloc
-        self.scanning = True
-        
-        # Créer les dossiers de sortie
-        site_dir = f"{self.config['output_dir']}/{self.target_domain}"
-        os.makedirs(site_dir, exist_ok=True)
-        os.makedirs(f"{site_dir}/pages", exist_ok=True)
-        os.makedirs(f"{site_dir}/assets", exist_ok=True)
-        os.makedirs(f"{site_dir}/sensitive", exist_ok=True)
-        os.makedirs(f"{site_dir}/databases", exist_ok=True)
-        os.makedirs(f"{site_dir}/reports", exist_ok=True)
-        
-        print(f"\n{self.colorize('🕷️ Debut du crawl de:', 'cyan')} {url}")
-        print(self.colorize("="*80, 'blue'))
-        print(f"📁 Dossier de sortie: {site_dir}")
-        print(f"📊 Max pages: {self.config['max_pages']}")
-        print(f"📊 Max depth: {self.config['max_depth']}")
-        print(f"🔍 Recherche de fichiers sensibles: {self.colorize('OUI', 'green') if self.config['download_sensitive'] else self.colorize('NON', 'red')}")
-        print(f"🗄️  Analyse de bases de donnees: {self.colorize('OUI', 'green') if self.config['analyze_db'] else self.colorize('NON', 'red')}")
-        print(self.colorize("="*80, 'blue'))
-        
-        self.results['statistics']['start_time'] = datetime.now()
-        
-        # Initialiser la file
-        self.queue.append((url, 0))
-        
-        # Lancer les threads
-        with ThreadPoolExecutor(max_workers=self.config['threads']) as executor:
-            while self.queue and len(self.visited_urls) < self.config['max_pages']:
-                if self.pause:
-                    time.sleep(1)
-                    continue
-                
-                try:
-                    current_url, depth = self.queue.popleft()
-                    if current_url in self.visited_urls:
-                        continue
-                    
-                    executor.submit(self.crawl_page, current_url, depth, site_dir)
-                    time.sleep(self.config['delay'])
-                except IndexError:
-                    break
-        
-        # Analyse complémentaire
-        print(self.colorize("\n🔍 Analyse complémentaire...", 'yellow'))
-        self.detect_technologies()
-        self.find_admin_pages()
-        self.extract_emails()
-        
-        # Statistiques finales
-        self.results['statistics']['end_time'] = datetime.now()
-        self.results['statistics']['duration'] = (
-            self.results['statistics']['end_time'] - 
-            self.results['statistics']['start_time']
-        ).total_seconds()
-        
-        self.scanning = False
-        
-        print(self.colorize("\n✅ Crawl termine!", 'green'))
-        print(f"📄 Pages: {self.results['statistics']['total_pages']}")
-        print(f"📁 Fichiers sensibles: {self.results['statistics']['total_sensitive']}")
-        print(f"🗄️  Bases de donnees: {self.results['statistics']['total_databases']}")
-        print(f"📦 Assets: {self.results['statistics']['total_assets']}")
-        print(f"📊 Duree: {self.results['statistics']['duration']:.2f} secondes")
-    
-    def crawl_page(self, url, depth, site_dir):
-        """Crawl une page individuelle."""
-        if url in self.visited_urls:
-            return
-        
-        with self.lock:
-            self.visited_urls.add(url)
-        
-        try:
-            response = requests.get(
-                url, 
-                headers={'User-Agent': self.config['user_agent']},
-                timeout=self.config['timeout'],
-                verify=self.config['verify_ssl'],
-                allow_redirects=self.config['follow_redirects']
-            )
-            
-            if response.status_code != 200:
-                return
-            
-            page_filename = self.save_page(url, response.text, site_dir)
-            
-            page_data = {
-                'url': url,
-                'depth': depth,
-                'status': response.status_code,
-                'size': len(response.content),
-                'filename': page_filename
-            }
-            
-            with self.lock:
-                self.results['pages'].append(page_data)
-                self.results['statistics']['total_pages'] += 1
-                self.results['statistics']['total_size'] += len(response.content)
-            
-            print(f"  📄 {url} ({len(response.content)} octets)")
-            
-            # Extraire les liens
-            if depth < self.config['max_depth']:
-                links = self.extract_links(response.text, url)
-                for link in links:
-                    if link not in self.visited_urls:
-                        with self.lock:
-                            self.queue.append((link, depth + 1))
-            
-            # Extraire et télécharger les assets
-            if self.config['download_assets']:
-                self.extract_assets(response.text, url, site_dir)
-            
-            # Rechercher des fichiers sensibles
-            if self.config['download_sensitive']:
-                self.search_sensitive_in_page(response.text, url, site_dir)
-            
-            # Extraire les formulaires
-            forms = self.extract_forms(response.text, url)
-            with self.lock:
-                self.results['forms'].extend(forms)
-            
-            # Extraire les commentaires
-            comments = self.extract_comments(response.text, url)
-            with self.lock:
-                self.results['comments'].extend(comments)
-            
-        except Exception as e:
-            print(f"  {self.colorize('⚠️', 'yellow')} Erreur sur {url}: {str(e)[:60]}")
-    
-    def extract_links(self, html, base_url):
-        """Extrait les liens d'une page."""
-        links = set()
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            if href and not href.startswith('#') and not href.startswith('javascript:'):
-                absolute_url = urljoin(base_url, href)
-                if self.target_domain in urlparse(absolute_url).netloc:
-                    links.add(absolute_url)
-        
-        for link in soup.find_all('link', href=True):
-            href = link['href']
-            if href:
-                absolute_url = urljoin(base_url, href)
-                if self.target_domain in urlparse(absolute_url).netloc:
-                    links.add(absolute_url)
-        
-        return links
-    
-    def extract_assets(self, html, base_url, site_dir):
-        """Extrait et télécharge les assets."""
-        soup = BeautifulSoup(html, 'html.parser')
-        assets_found = []
-        
-        for link in soup.find_all('link', rel='stylesheet', href=True):
-            href = link['href']
-            if href:
-                absolute_url = urljoin(base_url, href)
-                if any(href.endswith(ext) for ext in ['.css']):
-                    assets_found.append(absolute_url)
-        
-        for script in soup.find_all('script', src=True):
-            src = script['src']
-            if src:
-                absolute_url = urljoin(base_url, src)
-                if any(src.endswith(ext) for ext in ['.js']):
-                    assets_found.append(absolute_url)
-        
-        for img in soup.find_all('img', src=True):
-            src = img['src']
-            if src:
-                absolute_url = urljoin(base_url, src)
-                if any(src.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.ico']):
-                    assets_found.append(absolute_url)
-        
-        for asset_url in assets_found:
-            self.download_asset(asset_url, site_dir)
-    
-    def download_asset(self, url, site_dir):
-        """Télécharge un asset."""
-        if url in self.visited_files:
-            return
-        
-        with self.lock:
-            self.visited_files.add(url)
-        
-        try:
-            response = requests.get(
-                url,
-                headers={'User-Agent': self.config['user_agent']},
-                timeout=self.config['timeout'],
-                verify=self.config['verify_ssl']
-            )
-            
-            if response.status_code == 200:
-                filename = urlparse(url).path.split('/')[-1]
-                if not filename:
-                    filename = hashlib.md5(url.encode()).hexdigest()
-                
-                ext = os.path.splitext(filename)[1]
-                if not ext:
-                    content_type = response.headers.get('content-type', '')
-                    ext = mimetypes.guess_extension(content_type) or '.bin'
-                    filename += ext
-                
-                filepath = f"{site_dir}/assets/{filename}"
-                with open(filepath, 'wb') as f:
-                    f.write(response.content)
-                
-                with self.lock:
-                    self.results['assets'].append({
-                        'url': url,
-                        'filename': filename,
-                        'size': len(response.content)
-                    })
-                    self.results['statistics']['total_assets'] += 1
-                
-                print(f"    📦 Asset telecharge: {filename}")
-                
-        except Exception:
-            pass
-    
-    def save_page(self, url, html, site_dir):
-        """Sauvegarde une page."""
-        filename = urlparse(url).path.replace('/', '_') or 'index'
-        if not filename.endswith('.html'):
-            filename += '.html'
-        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-        
-        filepath = f"{site_dir}/pages/{filename}"
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(html)
-        
-        return filename
-    
-    # ==================== DÉTECTION FICHIERS SENSIBLES ====================
-    
-    def search_sensitive_in_page(self, html, url, site_dir):
-        """Recherche des fichiers sensibles dans le contenu de la page."""
-        found_urls = set()
-        
-        # === 1. Chercher dans les liens HTML ===
-        urls_in_page = re.findall(r'(?:href|src|action|data-url)=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        
-        for file_url in urls_in_page:
-            file_url_lower = file_url.lower()
-            
-            for ext in self.sensitive_extensions:
-                if file_url_lower.endswith(ext) or ext + '?' in file_url_lower or ext + '#' in file_url_lower:
-                    absolute_url = urljoin(url, file_url)
-                    if absolute_url not in found_urls:
-                        found_urls.add(absolute_url)
-                        self.download_sensitive_file(absolute_url, site_dir)
-                    break
-            
-            for fname in self.sensitive_filenames:
-                if fname.lower() in file_url_lower:
-                    absolute_url = urljoin(url, file_url)
-                    if absolute_url not in found_urls:
-                        found_urls.add(absolute_url)
-                        self.download_sensitive_file(absolute_url, site_dir)
-                    break
-            
-            for directory in self.sensitive_directories:
-                if directory.lower() in file_url_lower:
-                    absolute_url = urljoin(url, file_url)
-                    if absolute_url not in found_urls:
-                        found_urls.add(absolute_url)
-                        self.download_sensitive_file(absolute_url, site_dir)
-                    break
-        
-        # === 2. Chercher les chemins absolus dans le texte brut ===
-        ext_pattern = '|'.join([re.escape(e.lstrip('.')) for e in self.sensitive_extensions])
-        paths_ext = re.findall(
-            r'(/[a-zA-Z0-9_\-./]+\.(?:' + ext_pattern + r'))',
-            html, re.IGNORECASE
-        )
-        for path in paths_ext:
-            absolute_url = urljoin(url, path)
-            if absolute_url not in found_urls:
-                found_urls.add(absolute_url)
-                self.download_sensitive_file(absolute_url, site_dir)
-        
-        # === 3. Chercher les liens directs vers DB ===
-        db_link_patterns = [
-            r'href=["\']([^"\']*\.(?:sqlite|sqlite3|db|sql|dump|bson|rdb))["\']',
-            r'src=["\']([^"\']*\.(?:sqlite|sqlite3|db|sql))["\']',
-            r'["\']([^"\']*/(?:db|database|backup|dump|sql)/[^"\']*)["\']',
+    # ---------- UI ----------
+    def banner(self):
+        console.print(Panel.fit(
+            "[bold red]🕷️  JATHNIEL-WEB-CRAWLER-PRO v5.0[/]\n"
+            "[cyan]Crawl · Forced Browsing · DB · Ports · Subdomains · Wayback[/]\n"
+            "[dim]CTF / Lab / Authorized only[/]",
+            border_style="cyan",
+        ))
+
+    def menu(self):
+        table = Table(show_header=False, box=box.ROUNDED, border_style="cyan")
+        table.add_column("N", style="yellow", width=4)
+        table.add_column("Action", style="white")
+        rows = [
+            ("1", "Crawl complet (pages + assets + sensibles)"),
+            ("2", "Crawl + Forced Browsing + DB + Ports"),
+            ("3", "Forced Browsing seul"),
+            ("4", "Scan ports DB"),
+            ("5", "Subdomain enumeration"),
+            ("6", "Wayback Machine"),
+            ("7", "Voir résultats"),
+            ("8", "Voir bases de données"),
+            ("9", "Exporter (JSON / HTML)"),
+            ("10", "Configuration"),
+            ("0", "Quitter"),
         ]
-        for pattern in db_link_patterns:
-            matches = re.findall(pattern, html, re.IGNORECASE)
-            for match in matches:
-                absolute_url = urljoin(url, match)
-                if absolute_url not in found_urls:
-                    found_urls.add(absolute_url)
-                    self.download_sensitive_file(absolute_url, site_dir)
-    
-    def download_sensitive_file(self, url, site_dir):
-        """Télécharge un fichier sensible."""
-        if url in self.visited_files:
-            return False
-        
-        with self.lock:
-            self.visited_files.add(url)
-        
+        for n, a in rows:
+            table.add_row(n, a)
+        console.print(table)
+        if self.target_url:
+            console.print(f"[dim]Cible : {self.target_url} | Pages : {self.results['stats']['pages']} | "
+                          f"Sensibles : {self.results['stats']['sensitive']} | DB : {self.results['stats']['databases']}[/]")
+
+    # ---------- Helpers ----------
+    def _get(self, url: str, timeout: Optional[int] = None) -> Optional[requests.Response]:
         try:
-            response = requests.get(
-                url,
-                headers={'User-Agent': self.config['user_agent']},
-                timeout=self.config['timeout'],
-                verify=self.config['verify_ssl']
-            )
-            
-            if response.status_code != 200:
-                return False
-            
-            content_type = response.headers.get('content-type', '').lower()
-            content_len = len(response.content)
-            content = response.content
-            
-            # Détecter contenu intéressant
-            is_interesting_content = (
-                b'password' in content.lower() or
-                b'api_key' in content.lower() or
-                b'secret' in content.lower() or
-                b'token' in content.lower() or
-                b'BEGIN RSA' in content or
-                b'BEGIN PRIVATE KEY' in content or
-                b'BEGIN OPENSSH' in content or
-                b'<config' in content.lower() or
-                b'<?xml' in content.lower() or
-                b'SQLite format' in content or
-                b'CREATE TABLE' in content[:5000]
-            )
-            
-            # Ne pas télécharger les gros HTML
-            if 'text/html' in content_type and content_len > 100000 and not is_interesting_content:
-                return False
-            
-            # Limiter à 50 Mo pour les DB
-            max_size = 50 * 1024 * 1024 if any(url.endswith(ext) for ext in ['.sql', '.db', '.sqlite', '.sqlite3', '.dump']) else 10 * 1024 * 1024
-            if content_len > max_size:
-                return False
-            
-            filename = urlparse(url).path.split('/')[-1]
-            if not filename or filename.endswith('/'):
-                filename = 'index_' + hashlib.md5(url.encode()).hexdigest()[:8]
-            
-            if '.' not in filename:
-                ext = mimetypes.guess_extension(content_type.split(';')[0].strip()) or '.bin'
-                filename += ext
-            
-            filename = re.sub(r'[<>:"/\\|?*]', '_', filename)[:100]
-            
-            # Identifier le vrai type
-            real_type = self.identify_file_type(content)
-            
-            # Choisir le dossier de destination
-            if real_type in ['sqlite', 'mysql_dump', 'postgres_dump', 'redis_dump', 'bson'] or \
-               any(filename.lower().endswith(ext) for ext in ['.sql', '.db', '.sqlite', '.sqlite3', '.dump', '.bson', '.rdb']):
-                dest_dir = f"{site_dir}/databases"
-                is_database = True
-            else:
-                dest_dir = f"{site_dir}/sensitive"
-                is_database = False
-            
-            filepath = f"{dest_dir}/{filename}"
-            if os.path.exists(filepath):
-                base, ext = os.path.splitext(filename)
-                filename = f"{base}_{hashlib.md5(url.encode()).hexdigest()[:6]}{ext}"
-                filepath = f"{dest_dir}/{filename}"
-            
-            with open(filepath, 'wb') as f:
-                f.write(content)
-            
-            file_info = {
-                'url': url,
-                'filename': filename,
-                'size': content_len,
-                'path': filepath,
-                'type': self.classify_sensitive_file(filename),
-                'real_type': real_type,
-                'content_preview': content[:200].decode('utf-8', errors='ignore')
-            }
-            
-            with self.lock:
-                if is_database:
-                    self.results['databases'].append(file_info)
-                    self.results['statistics']['total_databases'] += 1
-                    print(f"    {self.colorize('🗄️  BASE DE DONNEES:', 'magenta')} {filename}")
-                else:
-                    self.results['sensitive_files'].append(file_info)
-                    self.results['statistics']['total_sensitive'] += 1
-                    print(f"    {self.colorize('🔴 FICHIER SENSIBLE:', 'red')} {filename}")
-                print(f"        📍 {url}")
-                print(f"        📦 {content_len} octets | Type: {real_type}")
-            
-            # Analyse auto si c'est une DB et que l'option est activée
-            if is_database and self.config['analyze_db']:
-                self.analyze_database(filepath, real_type, filename)
-            
-            return True
-        
-        except Exception as e:
-            print(f"    {self.colorize('⚠️', 'yellow')} Erreur sur {url}: {str(e)[:60]}")
-            return False
-    
-    def identify_file_type(self, content: bytes) -> str:
-        """Identifie le vrai type de fichier par magic bytes."""
-        for magic, name in self.magic_signatures.items():
+            return self.session.get(url, timeout=timeout or self.config["timeout"], allow_redirects=True)
+        except Exception:
+            return None
+
+    def identify_type(self, content: bytes) -> str:
+        sigs = {
+            b"SQLite format 3\x00": "sqlite",
+            b"PK\x03\x04": "zip",
+            b"\x1f\x8b": "gzip",
+            b"-- MySQL dump": "mysql_dump",
+            b"-- PostgreSQL database dump": "postgres_dump",
+            b"REDIS": "redis_dump",
+        }
+        for magic, name in sigs.items():
             if content.startswith(magic):
                 return name
-        
-        # Vérification supplémentaire pour les dumps SQL
-        preview = content[:5000]
-        if b'CREATE TABLE' in preview or b'INSERT INTO' in preview:
-            if b'`' in preview or b'ENGINE=' in preview:
-                return 'mysql_dump'
-            return 'sql_dump'
-        
-        return 'unknown'
-    
-    def classify_sensitive_file(self, filename):
-        """Classifie le type de fichier sensible."""
-        filename_lower = filename.lower()
-        
-        if any(x in filename_lower for x in ['.sqlite', '.sqlite3', '.db3', '.s3db']):
-            return 'SQLite Database'
-        elif '.sql' in filename_lower or 'dump' in filename_lower:
-            return 'SQL Dump'
-        elif '.rdb' in filename_lower:
-            return 'Redis Dump'
-        elif '.bson' in filename_lower or 'mongo' in filename_lower:
-            return 'MongoDB Export'
-        elif '.pgdump' in filename_lower:
-            return 'PostgreSQL Dump'
-        elif 'config' in filename_lower or '.env' in filename_lower or '.ini' in filename_lower:
-            return 'Configuration'
-        elif 'backup' in filename_lower or '.bak' in filename_lower:
-            return 'Backup'
-        elif '.log' in filename_lower:
-            return 'Log'
-        elif '.key' in filename_lower or '.pem' in filename_lower or 'id_rsa' in filename_lower or '.crt' in filename_lower:
-            return 'Certificate/Key'
-        elif '.git' in filename_lower or '.svn' in filename_lower:
-            return 'Version Control'
-        elif 'wp-config' in filename_lower:
-            return 'WordPress Config'
-        elif 'robots.txt' in filename_lower or 'sitemap' in filename_lower:
-            return 'SEO/Discovery'
-        elif any(x in filename_lower for x in ['.zip', '.rar', '.7z', '.tar', '.gz']):
-            return 'Archive'
-        elif 'package.json' in filename_lower or 'composer.json' in filename_lower or 'requirements.txt' in filename_lower:
-            return 'Dependencies'
-        elif '.bin' in filename_lower or '.dat' in filename_lower:
-            return 'Binary'
-        else:
-            return 'Other'
-    
-    # ==================== ANALYSE BASES DE DONNÉES ====================
-    
-    def analyze_database(self, filepath: str, real_type: str, filename: str):
-        """Analyse une base de données trouvée."""
-        print(f"    {self.colorize('🔬 Analyse de la base...', 'cyan')}")
-        
-        analysis = {
-            'file': filename,
-            'type': real_type,
-            'tables': {},
-            'error': None
-        }
-        
-        try:
-            if real_type == 'sqlite':
-                analysis = self.analyze_sqlite(filepath, filename)
-            elif real_type in ['mysql_dump', 'postgres_dump', 'sql_dump']:
-                analysis = self.analyze_sql_dump(filepath, filename)
-            elif real_type == 'gzip':
-                # DB compressée
-                analysis = self.analyze_compressed_db(filepath, filename)
-            elif real_type == 'zip':
-                # Archive peut contenir une DB
-                analysis = self.analyze_zip_archive(filepath, filename)
-            elif real_type == 'redis_dump':
-                analysis = self.analyze_redis_dump(filepath, filename)
-            elif real_type == 'bson':
-                analysis = self.analyze_bson(filepath, filename)
-            else:
-                # Tentative générique
-                analysis = self.analyze_generic_db(filepath, filename)
-        
-        except Exception as e:
-            analysis['error'] = str(e)
-        
-        # Stocker dans les résultats
+        preview = content[:4000]
+        if b"CREATE TABLE" in preview or b"INSERT INTO" in preview:
+            return "sql_dump"
+        return "unknown"
+
+    def is_interesting(self, content: bytes) -> bool:
+        low = content[:8000].lower()
+        keys = [b"password", b"api_key", b"secret", b"token", b"begin rsa",
+                b"begin private", b"create table", b"sqlite format"]
+        return any(k in low for k in keys)
+
+    # ---------- Crawl ----------
+    def crawl(self, url: str, full: bool = True):
+        self.target_url = url.rstrip("/")
+        parsed = urlparse(self.target_url)
+        self.target_domain = parsed.netloc
+        self.base_scheme = parsed.scheme or "https"
+
+        out = Path(self.config["output_dir"]) / self.target_domain
+        for d in ["pages", "sensitive", "databases", "reports"]:
+            (out / d).mkdir(parents=True, exist_ok=True)
+
+        self.results["stats"]["start"] = datetime.now()
+        self.visited.clear()
+        self.queue.clear()
+        self.queue.append((self.target_url, 0))
+
+        console.print(f"\n[cyan]🕷️  Crawl de[/] {self.target_url}")
+        console.print(f"[dim]Dossier : {out}[/]\n")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Crawl...", total=self.config["max_pages"])
+
+            with ThreadPoolExecutor(max_workers=self.config["threads"]) as pool:
+                futures = {}
+                while (self.queue or futures) and len(self.visited) < self.config["max_pages"]:
+                    while self.queue and len(futures) < self.config["threads"] * 2:
+                        u, depth = self.queue.popleft()
+                        if u in self.visited:
+                            continue
+                        self.visited.add(u)
+                        futures[pool.submit(self._crawl_page, u, depth, out)] = u
+
+                    if not futures:
+                        break
+
+                    done, _ = as_completed(futures), None
+                    for fut in list(futures.keys()):
+                        if fut.done():
+                            futures.pop(fut, None)
+                            progress.update(task, completed=len(self.visited))
+                            try:
+                                fut.result()
+                            except Exception:
+                                pass
+                    time.sleep(self.config["delay"])
+
+        if full and self.config["forced_browsing"]:
+            self.forced_browsing(out)
+        if full and self.config["port_scan"]:
+            self.scan_ports()
+        if full and self.config["subdomain_enum"]:
+            self.enum_subdomains()
+        if full and self.config["wayback"]:
+            self.wayback()
+
+        self._post_analysis()
+        self.results["stats"]["end"] = datetime.now()
+        self.results["stats"]["duration"] = (
+            self.results["stats"]["end"] - self.results["stats"]["start"]
+        ).total_seconds()
+
+        console.print(f"\n[green]✅ Crawl terminé[/] — "
+                      f"Pages: {self.results['stats']['pages']} | "
+                      f"Sensibles: {self.results['stats']['sensitive']} | "
+                      f"DB: {self.results['stats']['databases']} | "
+                      f"{self.results['stats']['duration']:.1f}s")
+
+    def _crawl_page(self, url: str, depth: int, out: Path):
+        resp = self._get(url)
+        if not resp or resp.status_code != 200:
+            return
+
+        content = resp.content
+        text = resp.text
+
+        # Sauvegarde page
+        name = urlparse(url).path.replace("/", "_") or "index"
+        name = re.sub(r"[^\w\-.]", "_", name)[:80]
+        if not name.endswith(".html"):
+            name += ".html"
+        (out / "pages" / name).write_text(text, encoding="utf-8", errors="ignore")
+
         with self.lock:
-            self.results['db_contents'][filename] = analysis
-        
-        # Afficher le résumé
-        self.display_db_summary(analysis)
-    
-    def analyze_sqlite(self, filepath: str, filename: str) -> dict:
-        """Analyse une base SQLite."""
-        result = {
-            'file': filename,
-            'type': 'SQLite',
-            'tables': {},
-            'error': None
+            self.results["pages"].append({"url": url, "status": resp.status_code, "size": len(content)})
+            self.results["stats"]["pages"] += 1
+
+        # Liens
+        if depth < self.config["max_depth"]:
+            soup = BeautifulSoup(text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("#") or href.startswith("javascript:"):
+                    continue
+                abs_url = urljoin(url, href)
+                if self.target_domain in urlparse(abs_url).netloc and abs_url not in self.visited:
+                    with self.lock:
+                        self.queue.append((abs_url, depth + 1))
+
+        # Fichiers sensibles dans la page
+        self._find_sensitive_in_html(text, url, out)
+
+        # Emails / forms / tech
+        for m in re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text):
+            with self.lock:
+                self.results["emails"].add(m)
+
+        for form in BeautifulSoup(text, "html.parser").find_all("form"):
+            with self.lock:
+                self.results["forms"].append({
+                    "url": url,
+                    "action": urljoin(url, form.get("action", "")),
+                    "method": form.get("method", "GET").upper(),
+                })
+
+        for tech, patterns in {
+            "WordPress": ["wp-content", "wp-includes"],
+            "Laravel": ["csrf-token", "laravel"],
+            "Django": ["csrfmiddlewaretoken"],
+            "React": ["react", "react-dom"],
+            "Vue": ["vue.js", "vue.min"],
+            "jQuery": ["jquery"],
+            "Bootstrap": ["bootstrap"],
+        }.items():
+            if any(p in text.lower() for p in patterns):
+                with self.lock:
+                    self.results["techs"].add(tech)
+
+    def _find_sensitive_in_html(self, html: str, base: str, out: Path):
+        candidates = set()
+        for m in re.findall(r'(?:href|src|action)=["\']([^"\']+)["\']', html, re.I):
+            candidates.add(urljoin(base, m))
+        for m in re.findall(r'(/[a-zA-Z0-9_\-./]+\.(?:env|sql|db|sqlite|sqlite3|bak|old|zip|tar\.gz|log|yml|yaml|json|pem|key))', html, re.I):
+            candidates.add(urljoin(base, m))
+
+        for u in candidates:
+            if any(u.lower().endswith(ext) for ext in [
+                ".env", ".sql", ".db", ".sqlite", ".sqlite3", ".bak", ".old",
+                ".zip", ".log", ".yml", ".yaml", ".pem", ".key", ".dump", ".rdb"
+            ]) or any(x in u.lower() for x in ["wp-config", "config.php", ".git", "backup"]):
+                self._download_sensitive(u, out)
+
+    def _download_sensitive(self, url: str, out: Path) -> bool:
+        if url in self.visited:
+            return False
+        with self.lock:
+            self.visited.add(url)
+
+        resp = self._get(url)
+        if not resp or resp.status_code != 200:
+            return False
+        content = resp.content
+        if len(content) > 40 * 1024 * 1024:
+            return False
+
+        real = self.identify_type(content)
+        is_db = real in ("sqlite", "mysql_dump", "postgres_dump", "sql_dump", "redis_dump", "gzip") or \
+                any(url.lower().endswith(e) for e in [".sql", ".db", ".sqlite", ".sqlite3", ".dump", ".rdb"])
+
+        fname = urlparse(url).path.split("/")[-1] or hashlib.md5(url.encode()).hexdigest()[:10]
+        fname = re.sub(r"[^\w\-.]", "_", fname)[:90]
+        dest_dir = out / ("databases" if is_db else "sensitive")
+        path = dest_dir / fname
+        if path.exists():
+            path = dest_dir / f"{path.stem}_{hashlib.md5(url.encode()).hexdigest()[:6]}{path.suffix}"
+        path.write_bytes(content)
+
+        info = {
+            "url": url, "filename": path.name, "size": len(content),
+            "path": str(path), "real_type": real,
         }
-        
-        try:
-            # Copier dans /tmp pour éviter les lock
-            tmp_path = f"/tmp/{filename}_analyze"
-            shutil.copy2(filepath, tmp_path)
-            
-            conn = sqlite3.connect(tmp_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [row[0] for row in cursor.fetchall()]
-            
-            for table in tables:
-                try:
-                    cursor.execute(f"SELECT COUNT(*) FROM `{table}`")
-                    count = cursor.fetchone()[0]
-                    
-                    cursor.execute(f"SELECT * FROM `{table}` LIMIT 10")
-                    rows = cursor.fetchall()
-                    cols = [desc[0] for desc in cursor.description] if cursor.description else []
-                    
-                    result['tables'][table] = {
-                        'columns': cols,
-                        'row_count': count,
-                        'sample': [list(row) for row in rows]
-                    }
-                except Exception as e:
-                    result['tables'][table] = {'error': str(e)}
-            
-            conn.close()
-            os.remove(tmp_path)
-        
-        except Exception as e:
-            result['error'] = str(e)
-        
-        return result
-    
-    def analyze_sql_dump(self, filepath: str, filename: str) -> dict:
-        """Analyse un dump SQL (MySQL, PostgreSQL, générique)."""
-        result = {
-            'file': filename,
-            'type': 'SQL Dump',
-            'tables': {},
-            'error': None
-        }
-        
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            # Détecter le SGBD
-            if '-- MySQL dump' in content[:200]:
-                result['type'] = 'MySQL Dump'
-            elif '-- PostgreSQL database dump' in content[:200]:
-                result['type'] = 'PostgreSQL Dump'
-            
-            # Trouver les tables
-            create_re = re.compile(r'CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[`"\[]?(\w+)[`"\]]?', re.IGNORECASE)
-            tables = create_re.findall(content)
-            
-            for table in tables:
-                insert_re = re.compile(
-                    rf'INSERT INTO\s+[`"\[]?{re.escape(table)}[`"\]]?\s+.*?;',
-                    re.IGNORECASE | re.DOTALL
-                )
-                inserts = insert_re.findall(content)
-                
-                # Extraire les colonnes du CREATE TABLE
-                create_table_re = re.compile(
-                    rf'CREATE TABLE\s+[`"\[]?{re.escape(table)}[`"\]]?\s*\((.*?)\)',
-                    re.IGNORECASE | re.DOTALL
-                )
-                create_match = create_table_re.search(content)
-                columns = []
-                if create_match:
-                    col_lines = create_match.group(1).split(',')
-                    for line in col_lines:
-                        col_match = re.match(r'\s*[`"\[]?(\w+)[`"\]]?', line)
-                        if col_match:
-                            col_name = col_match.group(1)
-                            if col_name.upper() not in ['PRIMARY', 'KEY', 'UNIQUE', 'INDEX', 'CONSTRAINT', 'FOREIGN']:
-                                columns.append(col_name)
-                
-                result['tables'][table] = {
-                    'columns': columns,
-                    'insert_count': len(inserts),
-                    'sample': [ins[:300] for ins in inserts[:3]]
-                }
-        
-        except Exception as e:
-            result['error'] = str(e)
-        
-        return result
-    
-    def analyze_compressed_db(self, filepath: str, filename: str) -> dict:
-        """Analyse une DB compressée (gzip)."""
-        result = {
-            'file': filename,
-            'type': 'Compressed DB',
-            'tables': {},
-            'error': None
-        }
-        
-        try:
-            with gzip.open(filepath, 'rb') as f:
-                decompressed = f.read()
-            
-            # Sauvegarder la version décompressée
-            decompressed_path = filepath.replace('.gz', '')
-            with open(decompressed_path, 'wb') as f:
-                f.write(decompressed)
-            
-            # Identifier le type
-            real_type = self.identify_file_type(decompressed)
-            result['decompressed_type'] = real_type
-            
-            # Analyser selon le type
-            if real_type == 'sqlite':
-                return self.analyze_sqlite(decompressed_path, filename.replace('.gz', ''))
-            elif 'dump' in real_type:
-                return self.analyze_sql_dump(decompressed_path, filename.replace('.gz', ''))
+        with self.lock:
+            if is_db:
+                self.results["databases"].append(info)
+                self.results["stats"]["databases"] += 1
+                console.print(f"  [magenta]🗄️  DB[/] {path.name} ({len(content)} o) ← {url}")
+                if self.config["analyze_db"]:
+                    self._analyze_db(str(path), real, path.name)
             else:
-                result['preview'] = decompressed[:500].decode('utf-8', errors='ignore')
-        
-        except Exception as e:
-            result['error'] = str(e)
-        
-        return result
-    
-    def analyze_zip_archive(self, filepath: str, filename: str) -> dict:
-        """Analyse une archive ZIP (peut contenir une DB)."""
-        result = {
-            'file': filename,
-            'type': 'ZIP Archive',
-            'contents': [],
-            'db_found': [],
-            'error': None
-        }
-        
-        try:
-            with zipfile.ZipFile(filepath, 'r') as z:
-                for name in z.namelist():
-                    result['contents'].append(name)
-                    
-                    # Si c'est une DB dans l'archive
-                    if any(name.lower().endswith(ext) for ext in ['.sql', '.db', '.sqlite', '.sqlite3', '.dump']):
-                        extract_dir = f"{os.path.dirname(filepath)}/extracted_{hashlib.md5(filename.encode()).hexdigest()[:6]}"
-                        os.makedirs(extract_dir, exist_ok=True)
-                        z.extract(name, extract_dir)
-                        extracted_path = os.path.join(extract_dir, name)
-                        
-                        real_type = 'unknown'
-                        with open(extracted_path, 'rb') as f:
-                            real_type = self.identify_file_type(f.read(100))
-                        
-                        result['db_found'].append({
-                            'name': name,
-                            'extracted_path': extracted_path,
-                            'type': real_type
-                        })
-                        
-                        # Analyser la DB extraite
-                        if real_type == 'sqlite':
-                            sub_analysis = self.analyze_sqlite(extracted_path, name)
-                            result['tables'] = sub_analysis.get('tables', {})
-        
-        except Exception as e:
-            result['error'] = str(e)
-        
-        return result
-    
-    def analyze_redis_dump(self, filepath: str, filename: str) -> dict:
-        """Analyse un dump Redis (RDB) - basique."""
-        result = {
-            'file': filename,
-            'type': 'Redis RDB',
-            'keys': [],
-            'error': None
-        }
-        
-        try:
-            with open(filepath, 'rb') as f:
-                content = f.read()
-            
-            # Extraction basique des strings (les clés Redis sont souvent en clair)
-            strings_found = re.findall(rb'[a-zA-Z0-9_:\-]{3,50}', content)
-            unique_keys = list(set([s.decode('utf-8', errors='ignore') for s in strings_found]))
-            
-            # Filtrer les clés probables (pas les magic bytes)
-            result['keys'] = [k for k in unique_keys if not k.startswith('REDIS')][:100]
-        
-        except Exception as e:
-            result['error'] = str(e)
-        
-        return result
-    
-    def analyze_bson(self, filepath: str, filename: str) -> dict:
-        """Analyse un fichier BSON (MongoDB)."""
-        result = {
-            'file': filename,
-            'type': 'MongoDB BSON',
-            'preview': '',
-            'error': None
-        }
-        
-        try:
-            with open(filepath, 'rb') as f:
-                content = f.read(10000)
-            
-            # Essayer de décoder en tant que texte
-            result['preview'] = content[:500].decode('utf-8', errors='ignore')
-            
-            # Chercher des patterns de documents MongoDB
-            strings_found = re.findall(rb'[a-zA-Z0-9_]{3,50}', content)
-            unique = list(set([s.decode('utf-8', errors='ignore') for s in strings_found]))
-            result['fields'] = unique[:50]
-        
-        except Exception as e:
-            result['error'] = str(e)
-        
-        return result
-    
-    def analyze_generic_db(self, filepath: str, filename: str) -> dict:
-        """Analyse générique - cherche du SQL ou des données structurées."""
-        result = {
-            'file': filename,
-            'type': 'Unknown (tentative generique)',
-            'tables': {},
-            'error': None
-        }
-        
-        try:
-            with open(filepath, 'rb') as f:
-                content = f.read()
-            
-            # Chercher des CREATE TABLE / INSERT
-            text = content.decode('utf-8', errors='ignore')
-            
-            create_re = re.compile(r'CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[`"\[]?(\w+)[`"\]]?', re.IGNORECASE)
-            tables = create_re.findall(text)
-            
-            for table in tables:
-                insert_re = re.compile(
-                    rf'INSERT INTO\s+[`"\[]?{re.escape(table)}[`"\]]?\s+.*?;',
-                    re.IGNORECASE | re.DOTALL
-                )
-                inserts = insert_re.findall(text)
-                result['tables'][table] = {
-                    'insert_count': len(inserts),
-                    'sample': [ins[:200] for ins in inserts[:2]]
-                }
-        
-        except Exception as e:
-            result['error'] = str(e)
-        
-        return result
-    
-    def display_db_summary(self, analysis: dict):
-        """Affiche un résumé de l'analyse de la DB."""
-        print(f"    {self.colorize('┌─ Résumé de la base', 'cyan')}")
-        print(f"    {self.colorize('│', 'cyan')} Fichier: {analysis.get('file', 'N/A')}")
-        print(f"    {self.colorize('│', 'cyan')} Type: {analysis.get('type', 'N/A')}")
-        
-        tables = analysis.get('tables', {})
-        if tables:
-            print(f"    {self.colorize('│', 'cyan')} Tables: {len(tables)}")
-            for table_name, table_data in list(tables.items())[:10]:
-                if 'error' in table_data:
-                    print(f"    {self.colorize('│', 'cyan')}   - {table_name}: [ERREUR]")
-                else:
-                    cols = table_data.get('columns', [])
-                    count = table_data.get('row_count', 0) or table_data.get('insert_count', 0)
-                    print(f"    {self.colorize('│', 'cyan')}   - {table_name}: {count} lignes, {len(cols)} colonnes")
-        
-        if analysis.get('keys'):
-            print(f"    {self.colorize('│', 'cyan')} Cles Redis: {len(analysis['keys'])}")
-        
-        if analysis.get('error'):
-            print(f"    {self.colorize('│', 'yellow')} Erreur: {analysis['error'][:80]}")
-        
-        print(f"    {self.colorize('└─', 'cyan')}")
-    
-    # ==================== ANALYSE AVANCÉE ====================
-    
-    def detect_technologies(self):
-        """Détecte les technologies utilisées."""
-        techs_found = set()
-        
-        for page in self.results['pages']:
-            try:
-                response = requests.get(
-                    page['url'],
-                    headers={'User-Agent': self.config['user_agent']},
-                    timeout=5,
-                    verify=self.config['verify_ssl']
-                )
-                
-                headers = response.headers
-                text = response.text
-                
-                for tech, patterns in self.tech_patterns.items():
-                    for pattern in patterns:
-                        if pattern.lower() in text.lower():
-                            techs_found.add(tech)
-                        if pattern.lower() in str(headers).lower():
-                            techs_found.add(tech)
-                
-                server = headers.get('Server', '')
-                if 'nginx' in server.lower():
-                    techs_found.add('Nginx')
-                elif 'apache' in server.lower():
-                    techs_found.add('Apache')
-                elif 'cloudflare' in server.lower():
-                    techs_found.add('Cloudflare')
-                
-            except Exception:
-                pass
-        
-        self.results['technologies'] = list(techs_found)
-    
-    def find_admin_pages(self):
-        """Recherche des pages d'administration."""
-        base_url = self.target_url.rstrip('/')
-        admin_urls = []
-        
-        for pattern in self.admin_patterns:
-            for ext in ['', '.php', '.html', '.asp', '.aspx']:
-                url = f"{base_url}/{pattern}{ext}"
+                self.results["sensitive"].append(info)
+                self.results["stats"]["sensitive"] += 1
+                console.print(f"  [red]🔴 Sensible[/] {path.name} ← {url}")
+        return True
+
+    # ---------- Forced Browsing ----------
+    def forced_browsing(self, out: Optional[Path] = None):
+        if not self.target_url:
+            console.print("[red]Aucune cible[/]")
+            return
+        if out is None:
+            out = Path(self.config["output_dir"]) / self.target_domain
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "sensitive").mkdir(exist_ok=True)
+            (out / "databases").mkdir(exist_ok=True)
+
+        console.print(f"\n[yellow]🔫 Forced Browsing[/] ({len(FORCED_PATHS)} chemins)...")
+        base = f"{self.base_scheme}://{self.target_domain}"
+
+        hits = []
+        with ThreadPoolExecutor(max_workers=15) as pool:
+            futs = {pool.submit(self._probe, base + p): p for p in FORCED_PATHS}
+            for fut in as_completed(futs):
+                path = futs[fut]
                 try:
-                    response = requests.get(
-                        url,
-                        headers={'User-Agent': self.config['user_agent']},
-                        timeout=5,
-                        verify=self.config['verify_ssl']
-                    )
-                    
-                    if response.status_code == 200:
-                        admin_urls.append(url)
-                        print(f"    🔐 Page admin trouvee: {url}")
-                        
-                        if self.config['download_sensitive']:
-                            self.download_sensitive_file(url, f"{self.config['output_dir']}/{self.target_domain}")
-                        
+                    ok, url, size = fut.result()
+                    if ok:
+                        hits.append(url)
+                        console.print(f"  [green]✓[/] {url} ({size} o)")
+                        self._download_sensitive(url, out)
                 except Exception:
                     pass
-        
-        self.results['admin_pages'] = admin_urls
-    
-    def extract_emails(self):
-        """Extrait les adresses email."""
-        emails = set()
-        email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-        
-        for page in self.results['pages']:
+
+        self.results["forced_hits"] = hits
+        console.print(f"[green]→ {len(hits)} hits[/]")
+
+    def _probe(self, url: str):
+        resp = self._get(url, timeout=8)
+        if resp and resp.status_code == 200 and len(resp.content) > 10:
+            # Filtrer les fausses pages 200 (souvent la home)
+            if len(resp.content) < 500 or self.is_interesting(resp.content) or \
+               any(x in url.lower() for x in [".env", ".sql", ".db", ".git", "backup", "config", "admin", "phpmyadmin"]):
+                return True, url, len(resp.content)
+        return False, url, 0
+
+    # ---------- Port Scan ----------
+    def scan_ports(self):
+        if not self.target_domain:
+            console.print("[red]Aucune cible[/]")
+            return
+        console.print(f"\n[yellow]🔌 Scan ports DB sur[/] {self.target_domain}...")
+        open_ports = []
+        for port, name in DB_PORTS.items():
             try:
-                response = requests.get(
-                    page['url'],
-                    headers={'User-Agent': self.config['user_agent']},
-                    timeout=5,
-                    verify=self.config['verify_ssl']
-                )
-                found = email_pattern.findall(response.text)
-                emails.update(found)
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                if s.connect_ex((self.target_domain, port)) == 0:
+                    open_ports.append({"port": port, "service": name})
+                    console.print(f"  [green]✓[/] {port}/tcp — {name}")
+                s.close()
             except Exception:
                 pass
-        
-        self.results['emails'] = list(emails)
-        if emails:
-            print(f"\n    📧 Emails trouves: {len(emails)}")
-            for email in list(emails)[:10]:
-                print(f"        - {email}")
-    
-    def extract_forms(self, html, base_url):
-        """Extrait les formulaires."""
-        forms = []
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        for form in soup.find_all('form'):
-            action = form.get('action', '')
-            method = form.get('method', 'GET').upper()
-            absolute_action = urljoin(base_url, action)
-            
-            fields = []
-            for input_tag in form.find_all(['input', 'textarea', 'select']):
-                field = {
-                    'name': input_tag.get('name', ''),
-                    'type': input_tag.get('type', 'text'),
-                    'required': input_tag.has_attr('required')
-                }
-                fields.append(field)
-            
-            has_csrf = any('csrf' in str(field).lower() or 'token' in str(field).lower() for field in fields)
-            
-            forms.append({
-                'url': base_url,
-                'action': absolute_action,
-                'method': method,
-                'fields': fields,
-                'has_csrf': has_csrf
-            })
-        
-        return forms
-    
-    def extract_comments(self, html, url):
-        """Extrait les commentaires HTML."""
-        comments = []
-        comment_pattern = re.compile(r'<!--(.*?)-->', re.DOTALL)
-        
-        found = comment_pattern.findall(html)
-        for comment in found:
-            comment = comment.strip()
-            if len(comment) > 10 and '<!--' not in comment:
-                comments.append({
-                    'page': url,
-                    'comment': comment[:200]
-                })
-        
-        return comments
-    
-    # ==================== AFFICHAGE ET EXPORT ====================
-    
-    def download_specific_file(self):
-        """Télécharge un fichier spécifique."""
-        print(self.colorize("\n📥 TELECHARGER UN FICHIER SPECIFIQUE", 'bold'))
-        print(self.colorize("="*60, 'cyan'))
-        
-        url = self.get_user_input("URL du fichier", "")
-        if not url:
-            return
-        
+        self.results["open_ports"] = open_ports
+        if not open_ports:
+            console.print("  [dim]Aucun port DB ouvert détecté[/]")
+
+    # ---------- Subdomains ----------
+    def enum_subdomains(self):
         if not self.target_domain:
-            self.target_domain = urlparse(url).netloc
-        
-        site_dir = f"{self.config['output_dir']}/{self.target_domain}"
-        os.makedirs(site_dir, exist_ok=True)
-        os.makedirs(f"{site_dir}/sensitive", exist_ok=True)
-        os.makedirs(f"{site_dir}/databases", exist_ok=True)
-        
-        print(f"\n🔍 Tentative de telechargement: {url}")
-        success = self.download_sensitive_file(url, site_dir)
-        
-        if success:
-            print(self.colorize("\n✅ Fichier telecharge avec succes!", 'green'))
-        else:
-            print(self.colorize("\n❌ Echec du telechargement", 'red'))
-        
-        input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-    
-    def show_sensitive_files(self):
-        """Affiche les fichiers sensibles trouvés."""
-        if not self.results['sensitive_files']:
-            print(self.colorize("\n❌ Aucun fichier sensible trouve", 'yellow'))
             return
-        
-        print(self.colorize("\n🔴 FICHIERS SENSIBLES TROUVES", 'bold'))
-        print(self.colorize("="*60, 'cyan'))
-        
-        by_type = defaultdict(list)
-        for file in self.results['sensitive_files']:
-            by_type[file['type']].append(file)
-        
-        for ftype, files in by_type.items():
-            print(f"\n{self.colorize(f'📁 {ftype} ({len(files)})', 'yellow', bold=True)}")
-            for file in files:
-                print(f"  • {self.colorize(file['filename'], 'red')} ({file['size']} octets) [{file.get('real_type', 'unknown')}]")
-                print(f"    📍 {file['url']}")
-    
-    def show_databases(self):
-        """Affiche les bases de données trouvées."""
-        if not self.results['databases']:
-            print(self.colorize("\n❌ Aucune base de donnees trouvee", 'yellow'))
+        root = self.target_domain.split(":")[0]
+        # Enlever www. si présent
+        if root.startswith("www."):
+            root = root[4:]
+        console.print(f"\n[yellow]🌐 Subdomain enum[/] *.{root}...")
+        found = []
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            futs = {pool.submit(self._resolve, f"{sub}.{root}"): sub for sub in SUBDOMAIN_WORDLIST}
+            for fut in as_completed(futs):
+                sub = futs[fut]
+                try:
+                    ip = fut.result()
+                    if ip:
+                        full = f"{sub}.{root}"
+                        found.append({"subdomain": full, "ip": ip})
+                        console.print(f"  [green]✓[/] {full} → {ip}")
+                except Exception:
+                    pass
+        self.results["subdomains"] = found
+        console.print(f"[green]→ {len(found)} sous-domaines[/]")
+
+    def _resolve(self, host: str) -> Optional[str]:
+        try:
+            return socket.gethostbyname(host)
+        except Exception:
+            return None
+
+    # ---------- Wayback ----------
+    def wayback(self):
+        if not self.target_domain:
             return
-        
-        print(self.colorize("\n🗄️  BASES DE DONNEES TROUVEES", 'bold'))
-        print(self.colorize("="*60, 'cyan'))
-        
-        for i, db in enumerate(self.results['databases'], 1):
-            print(f"\n{i}. {self.colorize(db['filename'], 'magenta')} ({db['size']} octets)")
-            print(f"   📍 {db['url']}")
-            print(f"   📂 {db['path']}")
-            print(f"   🔎 Type reel: {db.get('real_type', 'unknown')}")
-            
-            # Afficher le contenu analysé
-            analysis = self.results['db_contents'].get(db['filename'], {})
-            tables = analysis.get('tables', {})
-            
-            if tables:
-                print(f"   📊 {len(tables)} table(s):")
-                for table_name, table_data in tables.items():
-                    if 'error' in table_data:
-                        print(f"      - {table_name}: [ERREUR]")
-                    else:
-                        cols = table_data.get('columns', [])
-                        count = table_data.get('row_count', 0) or table_data.get('insert_count', 0)
-                        print(f"      - {table_name}: {count} lignes")
-                        if cols:
-                            print(f"        Colonnes: {', '.join(cols[:10])}")
-                        
-                        # Afficher un échantillon
-                        sample = table_data.get('sample', [])
-                        if sample:
-                            print(f"        Echantillon:")
-                            for row in sample[:3]:
-                                if isinstance(row, list):
-                                    print(f"          {' | '.join(str(c)[:30] for c in row)}")
-                                else:
-                                    print(f"          {str(row)[:100]}")
-            
-            if analysis.get('keys'):
-                print(f"   🔑 {len(analysis['keys'])} cles Redis detectees")
-                for key in analysis['keys'][:10]:
-                    print(f"      - {key}")
-            
-            if analysis.get('error'):
-                print(f"   ⚠️  Erreur: {analysis['error'][:100]}")
-    
-    def show_results(self):
-        """Affiche les résultats complets."""
-        print(self.colorize("\n📊 RESULTATS DU CRAWL", 'bold'))
-        print(self.colorize("="*60, 'cyan'))
-        
-        print(f"\n📄 Pages decouvertes: {len(self.results['pages'])}")
-        print(f"📦 Assets telecharges: {len(self.results['assets'])}")
-        print(f"🔴 Fichiers sensibles: {len(self.results['sensitive_files'])}")
-        print(f"🗄️  Bases de donnees: {len(self.results['databases'])}")
-        print(f"📝 Formulaires: {len(self.results['forms'])}")
-        print(f"📧 Emails: {len(self.results['emails'])}")
-        print(f"🔐 Pages admin: {len(self.results['admin_pages'])}")
-        
-        if self.results['technologies']:
-            print(f"\n⚙️ Technologies detectees:")
-            for tech in self.results['technologies']:
-                print(f"  - {tech}")
-    
-    def export_results(self):
-        """Exporte les résultats."""
-        print(self.colorize("\n📤 EXPORT DES RESULTATS", 'bold'))
-        print(self.colorize("="*60, 'cyan'))
-        
-        print("Formats disponibles:")
-        print("  1. JSON")
-        print("  2. HTML")
-        print("  3. CSV")
-        
-        choice = self.get_user_input("Choisissez le format", "1")
-        
-        site_dir = f"{self.config['output_dir']}/{self.target_domain}"
-        os.makedirs(f"{site_dir}/reports", exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        if choice == '1':
-            filename = f"{site_dir}/reports/crawl_report_{timestamp}.json"
-            with open(filename, 'w') as f:
-                json.dump(self.results, f, indent=2, default=str)
-            print(self.colorize(f"✅ Exporte dans: {filename}", 'green'))
-        
-        elif choice == '2':
-            filename = f"{site_dir}/reports/crawl_report_{timestamp}.html"
-            self.export_html_report(filename)
-            print(self.colorize(f"✅ Exporte dans: {filename}", 'green'))
-        
-        elif choice == '3':
-            filename = f"{site_dir}/reports/crawl_report_{timestamp}.csv"
-            self.export_csv_report(filename)
-            print(self.colorize(f"✅ Exporte dans: {filename}", 'green'))
-        
-        input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-    
-    def export_html_report(self, filename):
-        """Exporte un rapport HTML."""
-        html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Crawl Report - JATHNIEL v4.0</title>
-    <style>
-        body {{ font-family: Arial; margin: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1200px; margin: auto; background: white; padding: 20px; border-radius: 10px; }}
-        h1 {{ color: #d32f2f; }}
-        .header {{ background: #1e1e1e; color: white; padding: 15px; border-radius: 5px; }}
-        .stats {{ display: flex; gap: 20px; flex-wrap: wrap; }}
-        .stat-box {{ background: #e3f2fd; padding: 15px; border-radius: 5px; flex: 1; min-width: 150px; }}
-        .stat-box.db {{ background: #f3e5f5; }}
-        .stat-value {{ font-size: 24px; font-weight: bold; color: #1976d2; }}
-        .stat-box.db .stat-value {{ color: #7b1fa2; }}
-        .stat-label {{ font-size: 14px; color: #666; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-        th {{ background: #1e1e1e; color: white; padding: 10px; text-align: left; }}
-        td {{ padding: 10px; border-bottom: 1px solid #ddd; }}
-        .sensitive {{ background: #ffebee; border-left: 4px solid #d32f2f; }}
-        .database {{ background: #f3e5f5; border-left: 4px solid #7b1fa2; }}
-        .admin {{ background: #fff3e0; border-left: 4px solid #f57c00; }}
-        .db-detail {{ background: #fafafa; padding: 15px; margin: 10px 0; border-left: 4px solid #7b1fa2; }}
-        .db-detail pre {{ background: #263238; color: #aed581; padding: 10px; overflow-x: auto; border-radius: 4px; }}
-        .footer {{ text-align: center; margin-top: 30px; color: #666; font-size: 12px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🕷️ Web Crawl Report v4.0</h1>
-            <p>Generated by JATHNIEL-WEB-CRAWLER-PRO</p>
-            <p>Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            <p>Target: {self.target_url}</p>
-        </div>
-        
-        <h2>📊 Statistics</h2>
-        <div class="stats">
-            <div class="stat-box">
-                <div class="stat-value">{self.results['statistics']['total_pages']}</div>
-                <div class="stat-label">Pages</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-value">{self.results['statistics']['total_assets']}</div>
-                <div class="stat-label">Assets</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-value">{self.results['statistics']['total_sensitive']}</div>
-                <div class="stat-label">Sensitive Files</div>
-            </div>
-            <div class="stat-box db">
-                <div class="stat-value">{self.results['statistics']['total_databases']}</div>
-                <div class="stat-label">🗄️ Databases</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-value">{len(self.results['emails'])}</div>
-                <div class="stat-label">Emails</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-value">{self.results['statistics']['duration']:.2f}s</div>
-                <div class="stat-label">Duration</div>
-            </div>
-        </div>
-        
-        <h2>🗄️ Databases Found ({len(self.results['databases'])})</h2>"""
-        
-        for db in self.results['databases']:
-            analysis = self.results['db_contents'].get(db['filename'], {})
-            html += f"""
-            <div class="db-detail">
-                <h3>{db['filename']} <span style="color: #7b1fa2;">({db.get('real_type', 'unknown')})</span></h3>
-                <p><strong>URL:</strong> <a href="{db['url']}" target="_blank">{db['url']}</a></p>
-                <p><strong>Size:</strong> {db['size']} bytes</p>
-                <p><strong>Path:</strong> {db['path']}</p>
-            """
-            
-            tables = analysis.get('tables', {})
-            if tables:
-                html += f"<p><strong>Tables ({len(tables)}):</strong></p>"
-                for table_name, table_data in tables.items():
-                    if 'error' in table_data:
-                        html += f"<p>⚠️ {table_name}: {table_data['error']}</p>"
-                    else:
-                        cols = table_data.get('columns', [])
-                        count = table_data.get('row_count', 0) or table_data.get('insert_count', 0)
-                        html += f"""
-                        <details>
-                            <summary><strong>{table_name}</strong> ({count} rows, {len(cols)} columns)</summary>
-                            <p>Columns: {', '.join(cols)}</p>
-                            <pre>{json.dumps(table_data.get('sample', [])[:5], indent=2, default=str)[:2000]}</pre>
-                        </details>
-                        """
-            
-            if analysis.get('keys'):
-                html += f"<p><strong>Redis Keys ({len(analysis['keys'])}):</strong></p><pre>{chr(10).join(analysis['keys'][:20])}</pre>"
-            
-            html += "</div>"
-        
-        html += """
-        <h2>🔴 Sensitive Files</h2>
-        <table>
-            <tr>
-                <th>#</th>
-                <th>File</th>
-                <th>Type</th>
-                <th>Real Type</th>
-                <th>Size</th>
-                <th>URL</th>
-            </tr>"""
-        
-        for i, file in enumerate(self.results['sensitive_files'], 1):
-            html += f"""
-            <tr class="sensitive">
-                <td>{i}</td>
-                <td>{file['filename']}</td>
-                <td>{file['type']}</td>
-                <td>{file.get('real_type', 'unknown')}</td>
-                <td>{file['size']} bytes</td>
-                <td><a href="{file['url']}" target="_blank">{file['url'][:60]}...</a></td>
-            </tr>"""
-        
-        html += """
-        </table>
-        
-        <h2>🔐 Admin Pages</h2>
-        <table>
-            <tr><th>#</th><th>URL</th></tr>"""
-        
-        for i, url in enumerate(self.results['admin_pages'], 1):
-            html += f'<tr class="admin"><td>{i}</td><td><a href="{url}" target="_blank">{url}</a></td></tr>'
-        
-        html += """
-        </table>
-        
-        <h2>📧 Emails</h2>
-        <ul>"""
-        
-        for email in self.results['emails'][:30]:
-            html += f"<li>{email}</li>"
-        
-        html += """
-        </ul>
-        
-        <div class="footer">
-            <p>Generated by JATHNIEL-WEB-CRAWLER-PRO v4.0</p>
-            <p>CTF / Lab Tool - For educational and authorized purposes only</p>
-            <p>★ JATHNIEL ★</p>
-        </div>
-    </div>
-</body>
-</html>"""
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(html)
-    
-    def export_csv_report(self, filename):
-        """Exporte un rapport CSV."""
-        import csv
-        
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            
-            writer.writerow(['DATABASES'])
-            writer.writerow(['File', 'Type', 'Size', 'URL', 'Tables'])
-            for db in self.results['databases']:
-                analysis = self.results['db_contents'].get(db['filename'], {})
-                tables = list(analysis.get('tables', {}).keys())
-                writer.writerow([db['filename'], db.get('real_type', ''), db['size'], db['url'], ', '.join(tables)])
-            
-            writer.writerow([])
-            
-            writer.writerow(['SENSITIVE FILES'])
-            writer.writerow(['File', 'Type', 'Real Type', 'Size', 'URL'])
-            for file in self.results['sensitive_files']:
-                writer.writerow([file['filename'], file['type'], file.get('real_type', ''), file['size'], file['url']])
-            
-            writer.writerow([])
-            
-            writer.writerow(['ADMIN PAGES'])
-            writer.writerow(['URL'])
-            for url in self.results['admin_pages']:
-                writer.writerow([url])
-            
-            writer.writerow([])
-            
-            writer.writerow(['EMAILS'])
-            writer.writerow(['Email'])
-            for email in self.results['emails']:
-                writer.writerow([email])
-    
-    def show_statistics(self):
-        """Affiche les statistiques."""
-        stats = self.results['statistics']
-        
-        print(self.colorize("\n📊 STATISTIQUES DU CRAWL", 'bold'))
-        print(self.colorize("="*60, 'cyan'))
-        
-        print(f"\n📄 Pages decouvertes: {stats['total_pages']}")
-        print(f"📦 Assets telecharges: {stats['total_assets']}")
-        print(f"🔴 Fichiers sensibles: {stats['total_sensitive']}")
-        print(f"🗄️  Bases de donnees: {stats['total_databases']}")
-        print(f"📦 Taille totale: {self.format_size(stats['total_size'])}")
-        print(f"⏱️  Duree: {stats['duration']:.2f} secondes")
-        if stats['duration'] > 0:
-            print(f"🚀 Vitesse moyenne: {stats['total_pages'] / stats['duration']:.2f} pages/sec")
-    
-    def format_size(self, bytes):
-        """Formate la taille en unités lisibles."""
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if bytes < 1024:
-                return f"{bytes:.2f} {unit}"
-            bytes /= 1024
-        return f"{bytes:.2f} TB"
-    
-    # ==================== CONFIGURATION ====================
-    
-    def show_config(self):
-        """Affiche la configuration."""
-        print(self.colorize("\n⚙️ CONFIGURATION", 'bold'))
-        print(self.colorize("="*60, 'cyan'))
-        
-        for key, value in self.config.items():
-            print(f"  {key}: {self.colorize(str(value), 'green' if value else 'yellow')}")
-        
-        input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-    
-    def show_help(self):
-        """Affiche l'aide."""
-        help_text = f"""
-{self.colorize('📚 WEB CRAWLER PRO v4.0 - GUIDE D UTILISATION', 'bold')}
-{self.colorize('='*60, 'cyan')}
-
-{self.colorize('1. Crawl complet', 'green')}
-   - Explore tout le site
-   - Telecharge les pages, assets et fichiers sensibles
-   - Analyse les technologies et emails
-
-{self.colorize('2. Extraction de bases de donnees', 'green')}
-   - Recherche automatique des DB exposees
-   - Identification par magic bytes (extension trompeuse)
-   - Analyse automatique du contenu
-   - Extraction des tables, colonnes et donnees
-
-{self.colorize('3. Telechargement specifique', 'green')}
-   - Telecharge un fichier specifique
-   - Utile pour tester des URLs candidates
-
-{self.colorize('4. Export des resultats', 'green')}
-   - JSON: Donnees structurees
-   - HTML: Rapport visuel avec details DB
-   - CSV: Analyse dans Excel
-
-{self.colorize('🆕 NOUVEAU v4.0 :', 'yellow')}
-   - Detection SQLite / MySQL / PostgreSQL / MongoDB / Redis
-   - Magic bytes (admin.bin peut etre une SQLite)
-   - Analyse auto : tables, colonnes, echantillons
-   - Extraction des archives ZIP contenant des DB
-   - Support des DB compressees (.gz)
-
-{self.colorize('⚠️ RAPPEL', 'red')}
-   - Cadre CTF / Labo uniquement
-   - Vos propres machines ou autorisation ecrite
-   - Usage educatif et de securite
-        """
-        print(help_text)
-    
-    # ==================== MENU PRINCIPAL ====================
-    
-    def run(self):
-        """Boucle principale."""
-        while True:
-            self.clear_screen()
-            self.show_banner()
-            self.show_menu()
-            
-            choice = input(self.colorize("\n👉 Votre choix: ", 'bold')).strip()
-            
-            if choice == '1':
-                url = self.get_user_input("URL cible", "https://example.com")
-                if url:
-                    self.crawl_complete(url)
-                input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-            
-            elif choice == '2':
-                url = self.get_user_input("URL cible", "https://example.com")
-                if url:
-                    self.config['download_sensitive'] = True
-                    self.config['analyze_db'] = True
-                    self.crawl_complete(url)
-                input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-            
-            elif choice == '3':
-                self.download_specific_file()
-            
-            elif choice == '4':
-                self.show_results()
-                input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-            
-            elif choice == '5':
-                self.show_sensitive_files()
-                input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-            
-            elif choice == '6':
-                self.show_databases()
-                input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-            
-            elif choice == '7':
-                self.export_results()
-            
-            elif choice == '8':
-                self.show_config()
-            
-            elif choice == '9':
-                self.show_statistics()
-                input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-            
-            elif choice == '10':
-                self.show_help()
-                input(self.colorize("\nAppuyez sur Entree pour continuer...", 'blue'))
-            
-            elif choice == '0':
-                print(self.colorize("\n👋 Au revoir!", 'green'))
-                sys.exit(0)
-            
+        console.print(f"\n[yellow]⏪ Wayback Machine[/] {self.target_domain}...")
+        try:
+            cdx = f"https://web.archive.org/cdx/search/cdx?url=*.{self.target_domain}/*&output=json&fl=original&collapse=urlkey&limit=200"
+            resp = requests.get(cdx, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                urls = list({row[0] for row in data[1:]}) if len(data) > 1 else []
+                self.results["wayback_urls"] = urls[:150]
+                console.print(f"  [green]→ {len(urls)} URLs historiques[/]")
+                # Chercher des fichiers intéressants
+                for u in urls:
+                    if any(x in u.lower() for x in [".env", ".sql", ".db", "backup", "config", ".git"]):
+                        console.print(f"  [magenta]  interesting:[/] {u}")
             else:
-                print(self.colorize("❌ Choix invalide", 'red'))
-                time.sleep(1)
+                console.print("  [dim]Pas de données Wayback[/]")
+        except Exception as e:
+            console.print(f"  [red]Erreur Wayback : {e}[/]")
 
+    # ---------- DB Analysis ----------
+    def _analyze_db(self, filepath: str, real_type: str, filename: str):
+        analysis = {"file": filename, "type": real_type, "tables": {}, "error": None}
+        try:
+            if real_type == "sqlite":
+                analysis = self._analyze_sqlite(filepath, filename)
+            elif real_type in ("mysql_dump", "postgres_dump", "sql_dump"):
+                analysis = self._analyze_sql_dump(filepath, filename)
+            elif real_type == "gzip":
+                with gzip.open(filepath, "rb") as f:
+                    data = f.read()
+                tmp = filepath + ".decomp"
+                Path(tmp).write_bytes(data)
+                t = self.identify_type(data)
+                if t == "sqlite":
+                    analysis = self._analyze_sqlite(tmp, filename)
+                else:
+                    analysis = self._analyze_sql_dump(tmp, filename)
+                Path(tmp).unlink(missing_ok=True)
+        except Exception as e:
+            analysis["error"] = str(e)
+        with self.lock:
+            self.results["db_contents"][filename] = analysis
+        self._print_db_summary(analysis)
 
-# ==================== MAIN ====================
+    def _analyze_sqlite(self, path: str, name: str) -> dict:
+        res = {"file": name, "type": "SQLite", "tables": {}, "error": None}
+        try:
+            tmp = f"/tmp/jathniel_{hashlib.md5(path.encode()).hexdigest()[:8]}.db"
+            shutil.copy2(path, tmp)
+            conn = sqlite3.connect(tmp)
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            for (table,) in cur.fetchall():
+                try:
+                    cur.execute(f'SELECT COUNT(*) FROM "{table}"')
+                    cnt = cur.fetchone()[0]
+                    cur.execute(f'SELECT * FROM "{table}" LIMIT 5')
+                    rows = cur.fetchall()
+                    cols = [d[0] for d in cur.description] if cur.description else []
+                    res["tables"][table] = {"columns": cols, "row_count": cnt, "sample": [list(r) for r in rows]}
+                except Exception as e:
+                    res["tables"][table] = {"error": str(e)}
+            conn.close()
+            Path(tmp).unlink(missing_ok=True)
+        except Exception as e:
+            res["error"] = str(e)
+        return res
+
+    def _analyze_sql_dump(self, path: str, name: str) -> dict:
+        res = {"file": name, "type": "SQL Dump", "tables": {}, "error": None}
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            tables = re.findall(r"CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[`\"\[]?(\w+)[`\"\]]?", text, re.I)
+            for t in tables:
+                inserts = re.findall(rf"INSERT INTO\s+[`\"\[]?{re.escape(t)}[`\"\]]?.*?;", text, re.I | re.S)
+                res["tables"][t] = {"insert_count": len(inserts), "sample": [i[:200] for i in inserts[:3]]}
+        except Exception as e:
+            res["error"] = str(e)
+        return res
+
+    def _print_db_summary(self, a: dict):
+        console.print(f"    [cyan]└─ {a.get('type')} — {len(a.get('tables', {}))} tables[/]")
+        for t, d in list(a.get("tables", {}).items())[:6]:
+            if "error" in d:
+                console.print(f"       • {t}: erreur")
+            else:
+                n = d.get("row_count") or d.get("insert_count", 0)
+                console.print(f"       • {t}: {n} lignes")
+
+    def _post_analysis(self):
+        # Admin patterns rapides
+        for p in ["/admin", "/administrator", "/login", "/wp-admin", "/phpmyadmin"]:
+            url = f"{self.base_scheme}://{self.target_domain}{p}"
+            resp = self._get(url, timeout=5)
+            if resp and resp.status_code in (200, 301, 302, 401, 403):
+                self.results["admin"].append(url)
+
+    # ---------- Affichage / Export ----------
+    def show_results(self):
+        t = Table(title="Résultats", box=box.ROUNDED)
+        t.add_column("Métrique", style="cyan")
+        t.add_column("Valeur", style="green")
+        t.add_row("Pages", str(self.results["stats"]["pages"]))
+        t.add_row("Fichiers sensibles", str(self.results["stats"]["sensitive"]))
+        t.add_row("Bases de données", str(self.results["stats"]["databases"]))
+        t.add_row("Forced hits", str(len(self.results["forced_hits"])))
+        t.add_row("Sous-domaines", str(len(self.results["subdomains"])))
+        t.add_row("Ports ouverts", str(len(self.results["open_ports"])))
+        t.add_row("Wayback URLs", str(len(self.results["wayback_urls"])))
+        t.add_row("Emails", str(len(self.results["emails"])))
+        t.add_row("Technologies", ", ".join(self.results["techs"]) or "—")
+        console.print(t)
+
+        if self.results["sensitive"]:
+            console.print("\n[red]Fichiers sensibles :[/]")
+            for s in self.results["sensitive"][:20]:
+                console.print(f"  • {s['filename']} ← {s['url']}")
+
+        if self.results["open_ports"]:
+            console.print("\n[yellow]Ports ouverts :[/]")
+            for p in self.results["open_ports"]:
+                console.print(f"  • {p['port']}/tcp — {p['service']}")
+
+        if self.results["subdomains"]:
+            console.print("\n[cyan]Sous-domaines :[/]")
+            for s in self.results["subdomains"][:15]:
+                console.print(f"  • {s['subdomain']} → {s['ip']}")
+
+    def show_databases(self):
+        if not self.results["databases"]:
+            console.print("[yellow]Aucune base trouvée[/]")
+            return
+        for db in self.results["databases"]:
+            console.print(Panel(
+                f"[bold]{db['filename']}[/] ({db['size']} o)\n"
+                f"Type : {db.get('real_type')}\nURL : {db['url']}\nPath : {db['path']}",
+                title="🗄️ Database", border_style="magenta",
+            ))
+            analysis = self.results["db_contents"].get(db["filename"], {})
+            for t, d in analysis.get("tables", {}).items():
+                if "error" in d:
+                    continue
+                cols = d.get("columns", [])
+                n = d.get("row_count") or d.get("insert_count", 0)
+                console.print(f"  [green]{t}[/] — {n} lignes — cols: {', '.join(cols[:8])}")
+
+    def export(self):
+        if not self.target_domain:
+            console.print("[red]Rien à exporter[/]")
+            return
+        out = Path(self.config["output_dir"]) / self.target_domain / "reports"
+        out.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # JSON
+        data = {
+            "target": self.target_url,
+            "stats": self.results["stats"],
+            "sensitive": self.results["sensitive"],
+            "databases": self.results["databases"],
+            "db_contents": self.results["db_contents"],
+            "forced_hits": self.results["forced_hits"],
+            "subdomains": self.results["subdomains"],
+            "open_ports": self.results["open_ports"],
+            "wayback": self.results["wayback_urls"][:100],
+            "emails": list(self.results["emails"]),
+            "techs": list(self.results["techs"]),
+            "admin": self.results["admin"],
+        }
+        # Convert datetime
+        for k in ("start", "end"):
+            if data["stats"].get(k):
+                data["stats"][k] = str(data["stats"][k])
+
+        jpath = out / f"report_{ts}.json"
+        jpath.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        console.print(f"[green]JSON → {jpath}[/]")
+
+        # HTML simple
+        hpath = out / f"report_{ts}.html"
+        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Report {self.target_domain}</title>
+<style>body{{font-family:sans-serif;background:#0d1117;color:#c9d1d9;padding:20px}}
+h1,h2{{color:#58a6ff}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #30363d;padding:8px}}
+th{{background:#161b22}}a{{color:#58a6ff}}</style></head><body>
+<h1>JATHNIEL Crawler Report — {self.target_domain}</h1>
+<p>Date: {ts}</p>
+<h2>Stats</h2>
+<ul>
+<li>Pages: {self.results['stats']['pages']}</li>
+<li>Sensibles: {self.results['stats']['sensitive']}</li>
+<li>DB: {self.results['stats']['databases']}</li>
+<li>Forced hits: {len(self.results['forced_hits'])}</li>
+<li>Subdomains: {len(self.results['subdomains'])}</li>
+<li>Open ports: {len(self.results['open_ports'])}</li>
+</ul>
+<h2>Sensitive files</h2><ul>"""
+        for s in self.results["sensitive"]:
+            html += f'<li><a href="{s["url"]}">{s["filename"]}</a> ({s["size"]} o)</li>'
+        html += "</ul><h2>Databases</h2><ul>"
+        for d in self.results["databases"]:
+            html += f'<li><a href="{d["url"]}">{d["filename"]}</a> — {d.get("real_type")}</li>'
+        html += "</ul></body></html>"
+        hpath.write_text(html, encoding="utf-8")
+        console.print(f"[green]HTML → {hpath}[/]")
+
+    def show_config(self):
+        t = Table(title="Configuration", box=box.ROUNDED)
+        t.add_column("Clé", style="cyan")
+        t.add_column("Valeur", style="green")
+        for k, v in self.config.items():
+            t.add_row(k, str(v))
+        console.print(t)
+
+    # ---------- Main loop ----------
+    def run(self):
+        while True:
+            console.clear()
+            self.banner()
+            self.menu()
+            choice = Prompt.ask("\n[bold yellow]Choix[/]", choices=[str(i) for i in range(11)], default="0")
+
+            if choice == "0":
+                console.print("[green]Bye![/]")
+                break
+            elif choice == "1":
+                url = Prompt.ask("URL cible", default="https://example.com")
+                self.crawl(url, full=False)
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "2":
+                url = Prompt.ask("URL cible", default="https://example.com")
+                self.crawl(url, full=True)
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "3":
+                if not self.target_url:
+                    self.target_url = Prompt.ask("URL cible")
+                    self.target_domain = urlparse(self.target_url).netloc
+                    self.base_scheme = urlparse(self.target_url).scheme or "https"
+                self.forced_browsing()
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "4":
+                if not self.target_domain:
+                    self.target_domain = Prompt.ask("Domaine")
+                self.scan_ports()
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "5":
+                if not self.target_domain:
+                    self.target_domain = Prompt.ask("Domaine")
+                self.enum_subdomains()
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "6":
+                if not self.target_domain:
+                    self.target_domain = Prompt.ask("Domaine")
+                self.wayback()
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "7":
+                self.show_results()
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "8":
+                self.show_databases()
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "9":
+                self.export()
+                Prompt.ask("\nEntrée pour continuer")
+            elif choice == "10":
+                self.show_config()
+                Prompt.ask("\nEntrée pour continuer")
+
 
 if __name__ == "__main__":
     try:
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-        except ImportError:
-            print("[!] Installation des dependances...")
-            os.system("pip3 install requests beautifulsoup4")
-        
-        crawler = JATHNIELCrawlerPro()
-        crawler.run()
+        CrawlerPro().run()
     except KeyboardInterrupt:
-        print("\n\n👋 Au revoir!")
+        console.print("\n[yellow]Interrompu[/]")
         sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Erreur fatale: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
